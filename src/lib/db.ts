@@ -1,33 +1,97 @@
 import Database from 'better-sqlite3';
+import mysql from 'mysql2/promise';
 import path from 'path';
 
-// Construct the path to the SQLite database
-// In a real application, this path might come from an environment variable.
-const DB_PATH = path.resolve(process.cwd(), 'lims_mirror.db');
+export type DbType = 'sqlite' | 'mysql';
 
-let db: Database.Database;
-
-export function getDb(): Database.Database {
-  if (!db) {
-    db = new Database(DB_PATH, {
-      readonly: true, // We only need read access for the viewer
-      fileMustExist: true,
-    });
-  }
-  return db;
+interface DbConfig {
+  type: DbType;
+  sqlitePath: string;
+  mysqlHost: string;
+  mysqlPort: number;
+  mysqlUser: string;
+  mysqlPassword: string;
+  mysqlDatabase: string;
 }
 
-export function getTables(): string[] {
-  const database = getDb();
-  const stmt = database.prepare(`
-    SELECT name 
-    FROM sqlite_master 
-    WHERE type='table' 
-      AND name NOT LIKE 'sqlite_%'
-  `);
-  
-  const tables = stmt.all() as { name: string }[];
-  return tables.map(t => t.name);
+const envType = process.env.DB_TYPE as string | undefined;
+let config: DbConfig = {
+  type: (envType === 'sqlite' || envType === 'mysql' ? envType : 'sqlite') as DbType,
+  sqlitePath: path.resolve(process.cwd(), process.env.SQLITE_PATH || 'data/lims_mirror.db'),
+  mysqlHost: process.env.MYSQL_HOST || 'localhost',
+  mysqlPort: parseInt(process.env.MYSQL_PORT || '3306', 10),
+  mysqlUser: process.env.MYSQL_USER || 'root',
+  mysqlPassword: process.env.MYSQL_PASSWORD || '',
+  mysqlDatabase: process.env.MYSQL_DATABASE || 'lims',
+};
+
+let sqliteDb: Database.Database | null = null;
+let mysqlPool: mysql.Pool | null = null;
+let configVersion = 0;
+
+function needsPoolReset(partial: Partial<DbConfig>): boolean {
+  return 'mysqlHost' in partial || 'mysqlPort' in partial || 'mysqlUser' in partial ||
+         'mysqlPassword' in partial || 'mysqlDatabase' in partial;
+}
+
+export function getDbType(): DbType {
+  return config.type;
+}
+
+export function getDbConfig(): DbConfig {
+  return { ...config };
+}
+
+export function setDbConfig(partial: Partial<DbConfig>): void {
+  const changed = needsPoolReset(partial);
+  if ((partial.type && partial.type !== config.type) || changed) {
+    closeConnections();
+  }
+  config = { ...config, ...partial };
+  if (changed) configVersion++;
+}
+
+function closeConnections(): void {
+  if (sqliteDb) {
+    try { sqliteDb.close(); } catch {}
+    sqliteDb = null;
+  }
+  if (mysqlPool) {
+    try { mysqlPool.end(); } catch {}
+    mysqlPool = null;
+  }
+}
+
+let lastSqlitePath = '';
+function getSqliteDb(): Database.Database {
+  if (!sqliteDb || lastSqlitePath !== config.sqlitePath) {
+    if (sqliteDb) { try { sqliteDb.close(); } catch {} }
+    sqliteDb = new Database(config.sqlitePath, { readonly: true, fileMustExist: false });
+    lastSqlitePath = config.sqlitePath;
+  }
+  return sqliteDb;
+}
+
+let lastConfigVersion = -1;
+function getMySqlPool(): mysql.Pool {
+  if (!mysqlPool || lastConfigVersion !== configVersion) {
+    if (mysqlPool) { try { mysqlPool.end(); } catch {} }
+    mysqlPool = mysql.createPool({
+      host: config.mysqlHost,
+      port: config.mysqlPort,
+      user: config.mysqlUser,
+      password: config.mysqlPassword,
+      database: config.mysqlDatabase,
+      waitForConnections: true,
+      connectionLimit: 5,
+    });
+    lastConfigVersion = configVersion;
+  }
+  return mysqlPool;
+}
+
+function quoteIdent(name: string): string {
+  return config.type === 'mysql' ? `\`${name}\`` : `"${name}"`;
 }
 
 export interface ColumnSchema {
@@ -39,16 +103,51 @@ export interface ColumnSchema {
   pk: number;
 }
 
-export function getTableSchema(tableName: string): ColumnSchema[] {
-  const database = getDb();
-  // Using PRAGMA to get table info. Note that PRAGMA statements cannot use bound parameters in the same way,
-  // so we must interpolate. However, to prevent SQL injection, we must validate the table name first.
-  const tables = getTables();
+function validateTableName(tables: string[], tableName: string): void {
   if (!tables.includes(tableName)) {
     throw new Error(`Invalid table name: ${tableName}`);
   }
+}
 
-  const stmt = database.prepare(`PRAGMA table_info("${tableName}")`);
+export async function getTables(): Promise<string[]> {
+  if (config.type === 'mysql') {
+    const pool = getMySqlPool();
+    const [rows] = await pool.query<any>(
+      "SELECT TABLE_NAME as name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+      [config.mysqlDatabase]
+    );
+    return rows.map((r: any) => r.name);
+  }
+
+  const database = getSqliteDb();
+  const stmt = database.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+  );
+  return (stmt.all() as { name: string }[]).map(t => t.name);
+}
+
+export async function getTableSchema(tableName: string): Promise<ColumnSchema[]> {
+  const tables = await getTables();
+  validateTableName(tables, tableName);
+
+  if (config.type === 'mysql') {
+    const pool = getMySqlPool();
+    const [rows] = await pool.query<any>(
+      "SELECT COLUMN_NAME as name, DATA_TYPE as type, IS_NULLABLE as nullable, COLUMN_DEFAULT as dflt_value, COALESCE(CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, 0) as len FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+      [config.mysqlDatabase, tableName]
+    );
+    return rows.map((r: any, i: number) => ({
+      cid: i,
+      name: r.name,
+      type: r.type.toUpperCase(),
+      notnull: r.nullable === 'NO' ? 1 : 0,
+      dflt_value: r.dflt_value,
+      pk: 0,
+    }));
+  }
+
+  const database = getSqliteDb();
+  const stmt = database.prepare(`PRAGMA table_info(${quoteIdent(tableName)})`);
   return stmt.all() as ColumnSchema[];
 }
 
@@ -58,47 +157,139 @@ export interface FetchDataOptions {
   pageSize: number;
   sortBy?: string;
   sortDirection?: 'asc' | 'desc';
-  // simple filter: column name -> value
-  filters?: Record<string, string>;
+  filters?: Record<string, { value: string; operator: string }>;
+  globalSearch?: string;
+  filterLogic?: 'AND' | 'OR';
 }
 
-export function getTableData({ tableName, page, pageSize, sortBy, sortDirection, filters }: FetchDataOptions) {
-  const database = getDb();
-  const tables = getTables();
-  if (!tables.includes(tableName)) {
-    throw new Error(`Invalid table name: ${tableName}`);
-  }
+export async function getTableData({
+  tableName, page, pageSize, sortBy, sortDirection, filters, globalSearch, filterLogic,
+}: FetchDataOptions) {
+  const tables = await getTables();
+  validateTableName(tables, tableName);
 
-  const schema = getTableSchema(tableName);
+  const schema = await getTableSchema(tableName);
   const columnNames = schema.map(col => col.name);
 
-  // Validate sort column
   if (sortBy && !columnNames.includes(sortBy)) {
     throw new Error(`Invalid sort column: ${sortBy}`);
   }
 
-  const conditions: string[] = [];
+  const filterConditions: string[] = [];
+  const globalSearchParts: string[] = [];
   const params: any[] = [];
 
-  // Add filters safely
+  // Build column filter conditions
   if (filters) {
-    for (const [key, value] of Object.entries(filters)) {
+    for (const [key, { value, operator }] of Object.entries(filters)) {
       if (columnNames.includes(key) && value !== undefined && value !== '') {
-        // Simple case-insensitive LIKE search for text
-        conditions.push(`"${key}" LIKE ?`);
-        params.push(`%${value}%`);
+        const column = schema.find(c => c.name === key);
+        const isNumeric = column && ['INTEGER', 'REAL', 'FLOAT', 'DOUBLE', 'NUMERIC', 'DECIMAL', 'BIGINT', 'SMALLINT', 'TINYINT', 'INT', 'NUMBER'].some(t =>
+          column.type.toUpperCase().includes(t));
+
+        let condition: string;
+        let param: any;
+        const qi = quoteIdent(key);
+
+        switch (operator) {
+          case 'contains':
+            condition = `${qi} LIKE ?`;
+            param = `%${value}%`;
+            break;
+          case 'equals':
+            condition = `${qi} = ?`;
+            param = value;
+            break;
+          case 'startsWith':
+            condition = `${qi} LIKE ?`;
+            param = `${value}%`;
+            break;
+          case 'endsWith':
+            condition = `${qi} LIKE ?`;
+            param = `%${value}`;
+            break;
+          case '>':
+            if (isNumeric) { condition = `${qi} > ?`; param = parseFloat(value); }
+            else { condition = `${qi} > ?`; param = value; }
+            break;
+          case '<':
+            if (isNumeric) { condition = `${qi} < ?`; param = parseFloat(value); }
+            else { condition = `${qi} < ?`; param = value; }
+            break;
+          case '>=':
+            if (isNumeric) { condition = `${qi} >= ?`; param = parseFloat(value); }
+            else { condition = `${qi} >= ?`; param = value; }
+            break;
+          case '<=':
+            if (isNumeric) { condition = `${qi} <= ?`; param = parseFloat(value); }
+            else { condition = `${qi} <= ?`; param = value; }
+            break;
+          case '=':
+            condition = `${qi} = ?`; param = isNumeric ? parseFloat(value) : value;
+            break;
+          case '!=':
+            condition = `${qi} != ?`; param = isNumeric ? parseFloat(value) : value;
+            break;
+          default:
+            condition = `${qi} LIKE ?`; param = `%${value}%`;
+        }
+
+        filterConditions.push(condition);
+        params.push(param);
       }
     }
   }
 
-  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  const orderClause = sortBy ? `ORDER BY "${sortBy}" ${sortDirection === 'desc' ? 'DESC' : 'ASC'}` : '';
-  
+  // Build global search
+  if (globalSearch) {
+    const textColumns = schema.filter(c =>
+      ['TEXT', 'VARCHAR', 'CHAR'].some(t => c.type.toUpperCase().includes(t))
+    ).map(c => c.name);
+    const searchCols = textColumns.length > 0 ? textColumns : columnNames;
+    const clauses = searchCols.map(col => `${quoteIdent(col)} LIKE ?`);
+    globalSearchParts.push(`(${clauses.join(' OR ')})`);
+    for (let i = 0; i < searchCols.length; i++) {
+      params.push(`%${globalSearch}%`);
+    }
+  }
+
+  // Combine conditions
+  const joinLogic = filterLogic === 'OR' ? ' OR ' : ' AND ';
+  const combined: string[] = [];
+  if (filterConditions.length > 0) {
+    combined.push(`(${filterConditions.join(joinLogic)})`);
+  }
+  if (globalSearchParts.length > 0) {
+    combined.push(...globalSearchParts);
+  }
+  const whereClause = combined.length > 0 ? `WHERE ${combined.join(' AND ')}` : '';
+  const orderClause = sortBy ? `ORDER BY ${quoteIdent(sortBy)} ${sortDirection === 'desc' ? 'DESC' : 'ASC'}` : '';
   const offset = (page - 1) * pageSize;
-  const limitClause = `LIMIT ? OFFSET ?`;
-  
-  const dataQuery = `SELECT * FROM "${tableName}" ${whereClause} ${orderClause} ${limitClause}`;
-  const countQuery = `SELECT COUNT(*) as count FROM "${tableName}" ${whereClause}`;
+
+  const qi = quoteIdent(tableName);
+
+  if (config.type === 'mysql') {
+    const pool = getMySqlPool();
+    const countQuery = `SELECT COUNT(*) as count FROM ${qi} ${whereClause}`;
+    const dataQuery = `SELECT * FROM ${qi} ${whereClause} ${orderClause} LIMIT ? OFFSET ?`;
+
+    const [countRows] = await pool.query<any>(countQuery, params);
+    const totalCount = countRows[0].count;
+
+    const dataParams = [...params, pageSize, offset];
+    const [rows] = await pool.query<any>(dataQuery, dataParams);
+
+    return {
+      rows,
+      totalCount,
+      totalPages: Math.ceil(totalCount / pageSize),
+    };
+  }
+
+  // SQLite
+  const database = getSqliteDb();
+  const dataQuery = `SELECT * FROM ${qi} ${whereClause} ${orderClause} LIMIT ? OFFSET ?`;
+  const countQuery = `SELECT COUNT(*) as count FROM ${qi} ${whereClause}`;
 
   const countStmt = database.prepare(countQuery);
   const dataStmt = database.prepare(dataQuery);

@@ -8,35 +8,35 @@ export async function GET(
   try {
     const { tableName } = await params;
     const searchParams = request.nextUrl.searchParams;
-    
+
     const page = parseInt(searchParams.get('page') || '1', 10);
     const pageSize = parseInt(searchParams.get('pageSize') || '50', 10);
     const sortBy = searchParams.get('sortBy') || undefined;
     const sortDirection = (searchParams.get('sortDirection') as 'asc' | 'desc') || undefined;
+    const globalSearch = searchParams.get('globalSearch') || undefined;
+    const filterLogic = (searchParams.get('filterLogic') as 'AND' | 'OR') || 'AND';
 
-    // Parse filters
-    const filters: Record<string, string> = {};
+    const filters: Record<string, { value: string; operator: string }> = {};
     searchParams.forEach((value, key) => {
-      // Ignore known pagination/sorting keys
-      if (!['page', 'pageSize', 'sortBy', 'sortDirection'].includes(key)) {
-        filters[key] = value;
+      if (!['page', 'pageSize', 'sortBy', 'sortDirection', 'globalSearch', 'filterLogic'].includes(key)) {
+        if (key.endsWith('[operator]')) {
+          const columnName = key.slice(0, -10);
+          if (!filters[columnName]) filters[columnName] = { value: '', operator: 'contains' };
+          filters[columnName].operator = value;
+        } else if (key.endsWith('[value]')) {
+          const columnName = key.slice(0, -7);
+          if (!filters[columnName]) filters[columnName] = { value: '', operator: 'contains' };
+          filters[columnName].value = value;
+        }
       }
     });
 
-    const schema = getTableSchema(tableName);
-    const data = getTableData({
-      tableName,
-      page,
-      pageSize,
-      sortBy,
-      sortDirection,
-      filters,
-    });
+    const [schema, data] = await Promise.all([
+      getTableSchema(tableName),
+      getTableData({ tableName, page, pageSize, sortBy, sortDirection, filters, globalSearch, filterLogic }),
+    ]);
 
-    return NextResponse.json({
-      schema,
-      ...data,
-    });
+    return NextResponse.json({ schema, ...data });
   } catch (error: any) {
     console.error(`Error fetching data for table:`, error);
     return NextResponse.json(
