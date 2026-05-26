@@ -37,11 +37,9 @@ export async function GET(
     ]);
 
     return NextResponse.json({ schema, ...data });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error(`Error fetching data for table:`, error);
-    return NextResponse.json(
-      { error: error.message || 'Failed to fetch data' },
-      { status: 500 }
-    );
+    const msg = error instanceof Error ? error.message : 'Failed to fetch data';
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

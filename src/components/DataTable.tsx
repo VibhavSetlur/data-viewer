@@ -1,9 +1,9 @@
 'use client';
 
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight,
-  ArrowDownAZ, ArrowUpZA, Search, Settings2, Eye, EyeOff, X, AlertCircle, Filter, Plus, Trash2, ListFilter
+  ArrowDownAZ, ArrowUpZA, Search, Settings2, Eye, EyeOff, X, AlertCircle, Filter, Plus, ListFilter
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -17,7 +17,7 @@ interface ColumnSchema {
   name: string;
   type: string;
   notnull: number;
-  dflt_value: any;
+  dflt_value: unknown;
   pk: number;
 }
 
@@ -76,7 +76,7 @@ function highlightText(text: string, query: string): React.ReactNode {
 }
 
 export default function DataTable({ tableName }: DataTableProps) {
-  const [data, setData] = useState<any[]>([]);
+  const [data, setData] = useState<Record<string, unknown>[]>([]);
   const [schema, setSchema] = useState<ColumnSchema[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -102,6 +102,7 @@ export default function DataTable({ tableName }: DataTableProps) {
   const [showColSettings, setShowColSettings] = useState(false);
 
   const [pageJumpVal, setPageJumpVal] = useState<string>('1');
+  const [fetchKey, setFetchKey] = useState(0);
 
   // Convert filter entries to the Record format the API expects
   const appliedFilters = useMemo(() => {
@@ -114,60 +115,56 @@ export default function DataTable({ tableName }: DataTableProps) {
     return result;
   }, [filterEntries]);
 
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const params = new URLSearchParams();
-      params.set('page', page.toString());
-      params.set('pageSize', pageSize.toString());
-      if (sortBy) params.set('sortBy', sortBy);
-      if (sortDirection) params.set('sortDirection', sortDirection);
-      if (globalSearch) params.set('globalSearch', globalSearch);
-      params.set('filterLogic', filterLogic);
-
-      for (const [k, { value, operator }] of Object.entries(appliedFilters)) {
-        if (value) {
-          params.set(`${k}[operator]`, operator);
-          params.set(`${k}[value]`, value);
-        }
-      }
-
-      const res = await fetch(`/api/data/${tableName}?${params.toString()}`);
-      if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.error || 'Failed to fetch data');
-      }
-
-      const json = await res.json();
-      setSchema(json.schema);
-      setData(json.rows);
-      setTotalCount(json.totalCount);
-      setTotalPages(json.totalPages);
-      setPageJumpVal(page.toString());
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  }, [tableName, page, pageSize, sortBy, sortDirection, appliedFilters, globalSearch, filterLogic]);
-
   useEffect(() => {
-    setPage(1);
-    setSortBy(undefined);
-    setSortDirection(undefined);
-    setFilterEntries([{ id: newFilterId(), col: '', operator: 'contains', value: '' }]);
-    setFilterLogic('AND');
-    setGlobalSearch('');
-    setLocalGlobalSearch('');
-    setHiddenCols(new Set());
-    setShowColSettings(false);
-    setShowFilterPopup(false);
+    const t = setTimeout(() => {
+      setPage(1);
+      setSortBy(undefined);
+      setSortDirection(undefined);
+      setFilterEntries([{ id: newFilterId(), col: '', operator: 'contains', value: '' }]);
+      setFilterLogic('AND');
+      setGlobalSearch('');
+      setLocalGlobalSearch('');
+      setHiddenCols(new Set());
+      setShowColSettings(false);
+      setShowFilterPopup(false);
+    }, 0);
+    return () => clearTimeout(t);
   }, [tableName]);
 
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const params = new URLSearchParams();
+        params.set('page', page.toString());
+        params.set('pageSize', pageSize.toString());
+        if (sortBy) params.set('sortBy', sortBy);
+        if (sortDirection) params.set('sortDirection', sortDirection);
+        if (globalSearch) params.set('globalSearch', globalSearch);
+        params.set('filterLogic', filterLogic);
+        for (const [k, v] of Object.entries(appliedFilters)) {
+          params.set(`${k}[operator]`, v.operator);
+          params.set(`${k}[value]`, v.value);
+        }
+        const res = await fetch(`/api/data/${encodeURIComponent(tableName)}?${params.toString()}`);
+        if (cancelled) return;
+        const json = await res.json();
+        if (!res.ok) { setError(json.error || 'Failed to fetch data'); setLoading(false); return; }
+        setSchema(json.schema);
+        setData(json.rows);
+        setTotalCount(json.totalCount);
+        setTotalPages(json.totalPages);
+        setPageJumpVal(page.toString());
+      } catch (err: unknown) {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [tableName, page, pageSize, sortBy, sortDirection, appliedFilters, globalSearch, filterLogic, fetchKey]);
 
   // Close filter popup on outside click
   useEffect(() => {
@@ -251,7 +248,7 @@ export default function DataTable({ tableName }: DataTableProps) {
       <div className="p-6 text-center text-red-600 bg-red-50 rounded-lg border border-red-200 flex items-center justify-center gap-3">
         <AlertCircle className="w-5 h-5 shrink-0" />
         <span className="text-sm">{error}</span>
-        <button onClick={() => fetchData()} className="ml-3 px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 rounded text-xs font-medium transition-colors">Retry</button>
+        <button onClick={() => setFetchKey(k => k + 1)} className="ml-3 px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 rounded text-xs font-medium transition-colors">Retry</button>
       </div>
     );
   }
@@ -503,7 +500,7 @@ export default function DataTable({ tableName }: DataTableProps) {
       )}
 
       {/* Table */}
-      <div className="flex-1 overflow-auto relative bg-white dark:bg-gray-800 transition-colors" onClick={() => { showColSettings && setShowColSettings(false); }}>
+      <div className="flex-1 overflow-auto relative bg-white dark:bg-gray-800 transition-colors" onClick={() => { if (showColSettings) setShowColSettings(false); }}>
         <table className="w-full text-left border-collapse min-w-[600px]">
           <thead className="bg-slate-50 dark:bg-gray-800 sticky top-0 z-10 outline outline-1 outline-slate-200 dark:outline-gray-700 shadow-sm transition-colors">
             <tr>

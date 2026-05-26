@@ -9,8 +9,8 @@ export async function GET() {
 
   try {
     tables = await getTables();
-  } catch (e: any) {
-    error = e.message;
+  } catch (e: unknown) {
+    error = e instanceof Error ? e.message : String(e);
   }
 
   return NextResponse.json({
@@ -49,8 +49,8 @@ export async function POST(request: NextRequest) {
     let error: string | null = null;
     try {
       tables = await getTables();
-    } catch (e: any) {
-      error = e.message;
+    } catch (e: unknown) {
+      error = e instanceof Error ? e.message : String(e);
     }
 
     return NextResponse.json({
@@ -58,7 +58,8 @@ export async function POST(request: NextRequest) {
       tables,
       error,
     });
-  } catch (e: any) {
-    return NextResponse.json({ error: e.message }, { status: 500 });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

@@ -14,15 +14,31 @@ interface DbConfig {
   mysqlDatabase: string;
 }
 
+function parseMysqlUrl(url: string): { host: string; port: number; user: string; password: string; database: string } {
+  try {
+    const u = new URL(url);
+    return {
+      host: u.hostname || 'localhost',
+      port: parseInt(u.port || '3306', 10),
+      user: decodeURIComponent(u.username) || 'root',
+      password: decodeURIComponent(u.password || ''),
+      database: (u.pathname || '/lims').replace(/^\//, '') || 'lims',
+    };
+  } catch {
+    return { host: 'localhost', port: 3306, user: 'root', password: '', database: 'lims' };
+  }
+}
+
 const envType = process.env.DB_TYPE as string | undefined;
+const mysqlUrl = process.env.MYSQL_URL ? parseMysqlUrl(process.env.MYSQL_URL) : null;
 let config: DbConfig = {
   type: (envType === 'sqlite' || envType === 'mysql' ? envType : 'sqlite') as DbType,
   sqlitePath: path.resolve(process.cwd(), process.env.SQLITE_PATH || 'data/lims_mirror.db'),
-  mysqlHost: process.env.MYSQL_HOST || 'localhost',
-  mysqlPort: parseInt(process.env.MYSQL_PORT || '3306', 10),
-  mysqlUser: process.env.MYSQL_USER || 'root',
-  mysqlPassword: process.env.MYSQL_PASSWORD || '',
-  mysqlDatabase: process.env.MYSQL_DATABASE || 'lims',
+  mysqlHost: mysqlUrl?.host ?? process.env.MYSQL_HOST ?? 'localhost',
+  mysqlPort: mysqlUrl?.port ?? parseInt(process.env.MYSQL_PORT || '3306', 10),
+  mysqlUser: mysqlUrl?.user ?? process.env.MYSQL_USER ?? 'root',
+  mysqlPassword: mysqlUrl?.password ?? process.env.MYSQL_PASSWORD ?? '',
+  mysqlDatabase: mysqlUrl?.database ?? process.env.MYSQL_DATABASE ?? 'lims',
 };
 
 let sqliteDb: Database.Database | null = null;
@@ -94,12 +110,19 @@ function quoteIdent(name: string): string {
   return config.type === 'mysql' ? `\`${name}\`` : `"${name}"`;
 }
 
+import type { RowDataPacket } from 'mysql2/promise';
+
+interface MysqlTableRow extends RowDataPacket { name: string }
+interface MysqlColumnRow extends RowDataPacket { name: string; type: string; nullable: string; dflt_value: string | null }
+interface MysqlCountRow extends RowDataPacket { count: number }
+interface MysqlDataRow extends RowDataPacket { [key: string]: unknown }
+
 export interface ColumnSchema {
   cid: number;
   name: string;
   type: string;
   notnull: number;
-  dflt_value: any;
+  dflt_value: string | null | number | undefined;
   pk: number;
 }
 
@@ -112,11 +135,11 @@ function validateTableName(tables: string[], tableName: string): void {
 export async function getTables(): Promise<string[]> {
   if (config.type === 'mysql') {
     const pool = getMySqlPool();
-    const [rows] = await pool.query<any>(
+    const [rows] = await pool.query<MysqlTableRow[]>(
       "SELECT TABLE_NAME as name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
       [config.mysqlDatabase]
     );
-    return rows.map((r: any) => r.name);
+    return rows.map(r => r.name);
   }
 
   const database = getSqliteDb();
@@ -132,11 +155,11 @@ export async function getTableSchema(tableName: string): Promise<ColumnSchema[]>
 
   if (config.type === 'mysql') {
     const pool = getMySqlPool();
-    const [rows] = await pool.query<any>(
+    const [rows] = await pool.query<MysqlColumnRow[]>(
       "SELECT COLUMN_NAME as name, DATA_TYPE as type, IS_NULLABLE as nullable, COLUMN_DEFAULT as dflt_value, COALESCE(CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, 0) as len FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
       [config.mysqlDatabase, tableName]
     );
-    return rows.map((r: any, i: number) => ({
+    return rows.map((r, i: number) => ({
       cid: i,
       name: r.name,
       type: r.type.toUpperCase(),
@@ -177,7 +200,7 @@ export async function getTableData({
 
   const filterConditions: string[] = [];
   const globalSearchParts: string[] = [];
-  const params: any[] = [];
+  const params: (string | number)[] = [];
 
   // Build column filter conditions
   if (filters) {
@@ -188,7 +211,7 @@ export async function getTableData({
           column.type.toUpperCase().includes(t));
 
         let condition: string;
-        let param: any;
+        let param: string | number;
         const qi = quoteIdent(key);
 
         switch (operator) {
@@ -273,11 +296,11 @@ export async function getTableData({
     const countQuery = `SELECT COUNT(*) as count FROM ${qi} ${whereClause}`;
     const dataQuery = `SELECT * FROM ${qi} ${whereClause} ${orderClause} LIMIT ? OFFSET ?`;
 
-    const [countRows] = await pool.query<any>(countQuery, params);
+    const [countRows] = await pool.query<MysqlCountRow[]>(countQuery, params);
     const totalCount = countRows[0].count;
 
-    const dataParams = [...params, pageSize, offset];
-    const [rows] = await pool.query<any>(dataQuery, dataParams);
+    const dataParams: (string | number)[] = [...params, pageSize, offset];
+    const [rows] = await pool.query<MysqlDataRow[]>(dataQuery, dataParams);
 
     return {
       rows,

@@ -22,41 +22,36 @@ type DbType = 'sqlite' | 'mysql';
 export default function Dashboard({ initialTables }: DashboardProps) {
   const [activeTable, setActiveTable] = useState<string>(initialTables[0] || '');
   const [searchQuery, setSearchQuery] = useState('');
-  const [dark, setDark] = useState(false);
+  const [dark, setDark] = useState(() => document.documentElement.classList.contains('dark'));
   const [tables, setTables] = useState<string[]>(initialTables);
   const [dbType, setDbType] = useState<DbType>('sqlite');
   const [dbConnected, setDbConnected] = useState(true);
   const [showDbSwitcher, setShowDbSwitcher] = useState(false);
-  // MySQL connection fields
   const [mysqlHost, setMysqlHost] = useState('localhost');
   const [mysqlPort, setMysqlPort] = useState('3306');
   const [mysqlUser, setMysqlUser] = useState('root');
   const [mysqlPassword, setMysqlPassword] = useState('');
   const [mysqlDatabase, setMysqlDatabase] = useState('lims');
-  // SQLite path
-  const [sqlitePath, setSqlitePath] = useState('data/lims_mirror.db');
   const [switching, setSwitching] = useState(false);
   const [switchError, setSwitchError] = useState<string | null>(null);
 
   useEffect(() => {
-    const isDark = document.documentElement.classList.contains('dark');
-    setDark(isDark);
-    fetchConfig();
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/config');
+        const data = await res.json();
+        if (cancelled) return;
+        setDbType(data.type);
+        if (data.tables) setTables(data.tables);
+        setDbConnected(!data.error);
+        if (data.mysqlHost) setMysqlHost(data.mysqlHost);
+        if (data.mysqlPort) setMysqlPort(String(data.mysqlPort));
+        if (data.mysqlDatabase) setMysqlDatabase(data.mysqlDatabase);
+      } catch {}
+    })();
+    return () => { cancelled = true; };
   }, []);
-
-  const fetchConfig = async () => {
-    try {
-      const res = await fetch('/api/config');
-      const data = await res.json();
-      setDbType(data.type);
-      if (data.tables) setTables(data.tables);
-      setDbConnected(!data.error);
-      if (data.mysqlHost) setMysqlHost(data.mysqlHost);
-      if (data.mysqlPort) setMysqlPort(String(data.mysqlPort));
-      if (data.mysqlDatabase) setMysqlDatabase(data.mysqlDatabase);
-      if (data.sqlitePath) setSqlitePath(data.sqlitePath);
-    } catch {}
-  };
 
   const toggleTheme = () => {
     const next = !dark;
@@ -70,7 +65,7 @@ export default function Dashboard({ initialTables }: DashboardProps) {
     setSwitchError(null);
     setShowDbSwitcher(false);
     try {
-      const body: any = { type };
+      const body: Record<string, unknown> = { type };
       if (type === 'mysql') {
         body.mysqlHost = mysqlHost;
         body.mysqlPort = parseInt(mysqlPort, 10);
@@ -98,8 +93,8 @@ export default function Dashboard({ initialTables }: DashboardProps) {
         }
         setDbConnected(true);
       }
-    } catch (e: any) {
-      setSwitchError(e.message);
+    } catch (e: unknown) {
+      setSwitchError(e instanceof Error ? e.message : String(e));
       setDbConnected(false);
     } finally {
       setSwitching(false);

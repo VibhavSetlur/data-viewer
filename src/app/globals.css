@@ -1,6 +1,6 @@
 @import "tailwindcss";
 
-@custom-variant dark (&:where(.dark, .dark *));
+@variant dark (&:is(.dark *));
 
 @theme inline {
   --font-sans: var(--font-geist-sans);
