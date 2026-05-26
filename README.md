@@ -1,34 +1,31 @@
 # AI-ALE LIMS Data Viewer
 
-A web-based viewer for laboratory information management system (LIMS) data. Built with Next.js, supports SQLite (local) and MySQL (production on Poplar server).
+Web viewer for LIMS data. Uses SQLite by default, or MySQL if `MYSQL_URL` is set.
 
 ## Quick Start
 
 ```bash
 npm install
-cp .env.example .env.local   # edit DB_TYPE, MySQL credentials, or SQLITE_PATH
+cp .env.example .env.local   # set SQLITE_PATH or MYSQL_URL
 npm run dev                   # http://localhost:3000
 ```
 
-## Deploy on Poplar
+## Docker
 
 ```bash
-npm install && npm run build
-# Configure .env.local with MySQL settings (request credentials from Filipe)
-npm start
+cp .env.example .env.local
+cp /path/to/your.db data/
+docker compose up --build -d   # http://localhost:3000
 ```
 
 ## Environment
 
 | Variable | Default | Description |
 |---|---|---|
-| `DB_TYPE` | `sqlite` | `sqlite` or `mysql` |
-| `SQLITE_PATH` | `data/lims_mirror.db` | Path to SQLite file |
-| `MYSQL_HOST` | `localhost` | MySQL server host |
-| `MYSQL_PORT` | `3306` | MySQL server port |
-| `MYSQL_USER` | `root` | MySQL user |
-| `MYSQL_PASSWORD` | (empty) | MySQL password |
-| `MYSQL_DATABASE` | `lims` | MySQL database name |
+| `SQLITE_PATH` | `data/lims_mirror.db` | SQLite database path |
+| `MYSQL_URL` | — | MySQL connection string (`mysql://user:pass@host:3306/db`) |
+
+DB type is auto-detected: if `MYSQL_URL` is set, MySQL is used; otherwise SQLite.
 
 ## API
 

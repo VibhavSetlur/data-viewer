@@ -29,10 +29,9 @@ function parseMysqlUrl(url: string): { host: string; port: number; user: string;
   }
 }
 
-const envType = process.env.DB_TYPE as string | undefined;
 const mysqlUrl = process.env.MYSQL_URL ? parseMysqlUrl(process.env.MYSQL_URL) : null;
 let config: DbConfig = {
-  type: (envType === 'sqlite' || envType === 'mysql' ? envType : 'sqlite') as DbType,
+  type: mysqlUrl ? 'mysql' : 'sqlite',
   sqlitePath: path.resolve(process.cwd(), process.env.SQLITE_PATH || 'data/lims_mirror.db'),
   mysqlHost: mysqlUrl?.host ?? process.env.MYSQL_HOST ?? 'localhost',
   mysqlPort: mysqlUrl?.port ?? parseInt(process.env.MYSQL_PORT || '3306', 10),
