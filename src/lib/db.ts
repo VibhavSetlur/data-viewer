@@ -1,6 +1,9 @@
 import Database from 'better-sqlite3';
 import mysql from 'mysql2/promise';
 import path from 'path';
+import { loadEnvConfig } from '@next/env';
+
+loadEnvConfig(process.cwd());
 
 export type DbType = 'sqlite' | 'mysql';
 
