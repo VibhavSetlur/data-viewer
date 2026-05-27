@@ -32,7 +32,7 @@ function parseMysqlUrl(url: string): { host: string; port: number; user: string;
 const mysqlUrl = process.env.MYSQL_URL ? parseMysqlUrl(process.env.MYSQL_URL) : null;
 let config: DbConfig = {
   type: mysqlUrl ? 'mysql' : 'sqlite',
-  sqlitePath: path.resolve(process.cwd(), process.env.SQLITE_PATH || 'data/lims_mirror.db'),
+  sqlitePath: path.resolve(process.cwd(), process.env.SQLITE_PATH || 'data/lims_mirror.backup.db'),
   mysqlHost: mysqlUrl?.host ?? process.env.MYSQL_HOST ?? 'localhost',
   mysqlPort: mysqlUrl?.port ?? parseInt(process.env.MYSQL_PORT || '3306', 10),
   mysqlUser: mysqlUrl?.user ?? process.env.MYSQL_USER ?? 'root',
@@ -106,7 +106,7 @@ function getMySqlPool(): mysql.Pool {
 }
 
 function quoteIdent(name: string): string {
-  return config.type === 'mysql' ? `\`${name}\`` : `"${name}"`;
+  return config.type === 'mysql' ? `\`${name.replace(/`/g, '``')}\`` : `"${name.replace(/"/g, '""')}"`;
 }
 
 import type { RowDataPacket } from 'mysql2/promise';
@@ -115,6 +115,7 @@ interface MysqlTableRow extends RowDataPacket { name: string }
 interface MysqlColumnRow extends RowDataPacket { name: string; type: string; nullable: string; dflt_value: string | null }
 interface MysqlCountRow extends RowDataPacket { count: number }
 interface MysqlDataRow extends RowDataPacket { [key: string]: unknown }
+interface MysqlDistinctRow extends RowDataPacket { v: unknown }
 
 export interface ColumnSchema {
   cid: number;
@@ -123,6 +124,11 @@ export interface ColumnSchema {
   notnull: number;
   dflt_value: string | null | number | undefined;
   pk: number;
+}
+
+export interface TableInfo {
+  name: string;
+  rowCount: number;
 }
 
 function validateTableName(tables: string[], tableName: string): void {
@@ -135,7 +141,7 @@ export async function getTables(): Promise<string[]> {
   if (config.type === 'mysql') {
     const pool = getMySqlPool();
     const [rows] = await pool.query<MysqlTableRow[]>(
-      "SELECT TABLE_NAME as name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+      "SELECT TABLE_NAME as name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME",
       [config.mysqlDatabase]
     );
     return rows.map(r => r.name);
@@ -143,9 +149,37 @@ export async function getTables(): Promise<string[]> {
 
   const database = getSqliteDb();
   const stmt = database.prepare(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
   );
   return (stmt.all() as { name: string }[]).map(t => t.name);
+}
+
+export async function getTablesWithCounts(): Promise<TableInfo[]> {
+  const tables = await getTables();
+  const results: TableInfo[] = [];
+
+  if (config.type === 'mysql') {
+    const pool = getMySqlPool();
+    // Use INFORMATION_SCHEMA TABLE_ROWS (approximate for InnoDB but fast)
+    const [rows] = await pool.query<(RowDataPacket & { name: string; n: number })[]>(
+      "SELECT TABLE_NAME as name, TABLE_ROWS as n FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+      [config.mysqlDatabase]
+    );
+    const map = new Map(rows.map(r => [r.name, Number(r.n) || 0]));
+    for (const t of tables) results.push({ name: t, rowCount: map.get(t) ?? 0 });
+    return results;
+  }
+
+  const database = getSqliteDb();
+  for (const t of tables) {
+    try {
+      const row = database.prepare(`SELECT COUNT(*) as c FROM ${quoteIdent(t)}`).get() as { c: number };
+      results.push({ name: t, rowCount: Number(row.c) || 0 });
+    } catch {
+      results.push({ name: t, rowCount: 0 });
+    }
+  }
+  return results;
 }
 
 export async function getTableSchema(tableName: string): Promise<ColumnSchema[]> {
@@ -155,7 +189,7 @@ export async function getTableSchema(tableName: string): Promise<ColumnSchema[]>
   if (config.type === 'mysql') {
     const pool = getMySqlPool();
     const [rows] = await pool.query<MysqlColumnRow[]>(
-      "SELECT COLUMN_NAME as name, DATA_TYPE as type, IS_NULLABLE as nullable, COLUMN_DEFAULT as dflt_value, COALESCE(CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, 0) as len FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+      "SELECT COLUMN_NAME as name, DATA_TYPE as type, IS_NULLABLE as nullable, COLUMN_DEFAULT as dflt_value FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
       [config.mysqlDatabase, tableName]
     );
     return rows.map((r, i: number) => ({
@@ -173,6 +207,41 @@ export async function getTableSchema(tableName: string): Promise<ColumnSchema[]>
   return stmt.all() as ColumnSchema[];
 }
 
+export async function getDistinctValues(
+  tableName: string,
+  columnName: string,
+  limit = 200
+): Promise<{ values: unknown[]; truncated: boolean }> {
+  const tables = await getTables();
+  validateTableName(tables, tableName);
+  const schema = await getTableSchema(tableName);
+  if (!schema.some(c => c.name === columnName)) {
+    throw new Error(`Invalid column: ${columnName}`);
+  }
+  const qt = quoteIdent(tableName);
+  const qc = quoteIdent(columnName);
+  const cap = Math.max(1, Math.min(1000, limit));
+
+  if (config.type === 'mysql') {
+    const pool = getMySqlPool();
+    const [rows] = await pool.query<MysqlDistinctRow[]>(
+      `SELECT DISTINCT ${qc} as v FROM ${qt} WHERE ${qc} IS NOT NULL ORDER BY ${qc} LIMIT ?`,
+      [cap + 1]
+    );
+    const values = rows.map(r => r.v);
+    const truncated = values.length > cap;
+    return { values: values.slice(0, cap), truncated };
+  }
+
+  const database = getSqliteDb();
+  const rows = database
+    .prepare(`SELECT DISTINCT ${qc} as v FROM ${qt} WHERE ${qc} IS NOT NULL ORDER BY ${qc} LIMIT ?`)
+    .all(cap + 1) as { v: unknown }[];
+  const values = rows.map(r => r.v);
+  const truncated = values.length > cap;
+  return { values: values.slice(0, cap), truncated };
+}
+
 export interface FetchDataOptions {
   tableName: string;
   page: number;
@@ -182,10 +251,142 @@ export interface FetchDataOptions {
   filters?: Record<string, { value: string; operator: string }>;
   globalSearch?: string;
   filterLogic?: 'AND' | 'OR';
+  columns?: string[]; // optional projection (for export); default = *
+  limit?: number; // override page-based limit (for export). When set, page/pageSize are ignored.
+}
+
+function isNumericType(type: string): boolean {
+  const u = type.toUpperCase();
+  return ['INTEGER', 'REAL', 'FLOAT', 'DOUBLE', 'NUMERIC', 'DECIMAL', 'BIGINT', 'SMALLINT', 'TINYINT', 'INT', 'NUMBER'].some(t => u.includes(t));
+}
+
+function splitList(value: string): string[] {
+  return value.split(',').map(s => s.trim()).filter(s => s.length > 0);
+}
+
+function buildCondition(
+  qi: string,
+  operator: string,
+  value: string,
+  isNumeric: boolean,
+  params: (string | number | null)[]
+): string | null {
+  switch (operator) {
+    case 'contains': {
+      params.push(`%${value}%`);
+      return `${qi} LIKE ?`;
+    }
+    case 'notContains': {
+      params.push(`%${value}%`);
+      return `${qi} NOT LIKE ?`;
+    }
+    case 'equals': {
+      params.push(value);
+      return `${qi} = ?`;
+    }
+    case 'startsWith': {
+      params.push(`${value}%`);
+      return `${qi} LIKE ?`;
+    }
+    case 'endsWith': {
+      params.push(`%${value}`);
+      return `${qi} LIKE ?`;
+    }
+    case '>':
+    case '<':
+    case '>=':
+    case '<=':
+    case '=':
+    case '!=': {
+      params.push(isNumeric ? parseFloat(value) : value);
+      return `${qi} ${operator} ?`;
+    }
+    case 'isNull':
+      return `${qi} IS NULL`;
+    case 'isNotNull':
+      return `${qi} IS NOT NULL`;
+    case 'in':
+    case 'notIn': {
+      const list = splitList(value);
+      if (list.length === 0) return null;
+      const placeholders = list.map(() => '?').join(',');
+      for (const v of list) params.push(isNumeric ? parseFloat(v) : v);
+      return `${qi} ${operator === 'in' ? 'IN' : 'NOT IN'} (${placeholders})`;
+    }
+    case 'between': {
+      const parts = value.split(',').map(s => s.trim());
+      if (parts.length < 2 || parts[0] === '' || parts[1] === '') return null;
+      params.push(isNumeric ? parseFloat(parts[0]) : parts[0]);
+      params.push(isNumeric ? parseFloat(parts[1]) : parts[1]);
+      return `${qi} BETWEEN ? AND ?`;
+    }
+    default: {
+      params.push(`%${value}%`);
+      return `${qi} LIKE ?`;
+    }
+  }
+}
+
+// Operators that don't need a value
+const NO_VALUE_OPS = new Set(['isNull', 'isNotNull']);
+
+interface BuildWhereResult {
+  whereClause: string;
+  params: (string | number | null)[];
+}
+
+function buildWhere(
+  schema: ColumnSchema[],
+  filters: Record<string, { value: string; operator: string }> | undefined,
+  globalSearch: string | undefined,
+  filterLogic: 'AND' | 'OR' | undefined,
+  columnNames: string[]
+): BuildWhereResult {
+  const filterConditions: string[] = [];
+  const globalSearchParts: string[] = [];
+  const params: (string | number | null)[] = [];
+
+  if (filters) {
+    for (const [key, { value, operator }] of Object.entries(filters)) {
+      if (!columnNames.includes(key)) continue;
+      const needsValue = !NO_VALUE_OPS.has(operator);
+      if (needsValue && (value === undefined || value === '')) continue;
+      const column = schema.find(c => c.name === key)!;
+      const isNumeric = isNumericType(column.type);
+      const qi = quoteIdent(key);
+      const cond = buildCondition(qi, operator, value, isNumeric, params);
+      if (cond) filterConditions.push(cond);
+    }
+  }
+
+  if (globalSearch) {
+    const textColumns = schema.filter(c =>
+      ['TEXT', 'VARCHAR', 'CHAR', 'CLOB', 'STRING'].some(t => c.type.toUpperCase().includes(t))
+    ).map(c => c.name);
+    const searchCols = textColumns.length > 0 ? textColumns : columnNames;
+    const clauses = searchCols.map(col => `${quoteIdent(col)} LIKE ?`);
+    globalSearchParts.push(`(${clauses.join(' OR ')})`);
+    for (let i = 0; i < searchCols.length; i++) {
+      params.push(`%${globalSearch}%`);
+    }
+  }
+
+  const joinLogic = filterLogic === 'OR' ? ' OR ' : ' AND ';
+  const combined: string[] = [];
+  if (filterConditions.length > 0) {
+    combined.push(`(${filterConditions.join(joinLogic)})`);
+  }
+  if (globalSearchParts.length > 0) {
+    combined.push(...globalSearchParts);
+  }
+  return {
+    whereClause: combined.length > 0 ? `WHERE ${combined.join(' AND ')}` : '',
+    params,
+  };
 }
 
 export async function getTableData({
-  tableName, page, pageSize, sortBy, sortDirection, filters, globalSearch, filterLogic,
+  tableName, page, pageSize, sortBy, sortDirection, filters, globalSearch, filterLogic, columns, limit,
 }: FetchDataOptions) {
   const tables = await getTables();
   validateTableName(tables, tableName);
@@ -197,108 +398,30 @@ export async function getTableData({
     throw new Error(`Invalid sort column: ${sortBy}`);
   }
 
-  const filterConditions: string[] = [];
-  const globalSearchParts: string[] = [];
-  const params: (string | number)[] = [];
-
-  // Build column filter conditions
-  if (filters) {
-    for (const [key, { value, operator }] of Object.entries(filters)) {
-      if (columnNames.includes(key) && value !== undefined && value !== '') {
-        const column = schema.find(c => c.name === key);
-        const isNumeric = column && ['INTEGER', 'REAL', 'FLOAT', 'DOUBLE', 'NUMERIC', 'DECIMAL', 'BIGINT', 'SMALLINT', 'TINYINT', 'INT', 'NUMBER'].some(t =>
-          column.type.toUpperCase().includes(t));
-
-        let condition: string;
-        let param: string | number;
-        const qi = quoteIdent(key);
-
-        switch (operator) {
-          case 'contains':
-            condition = `${qi} LIKE ?`;
-            param = `%${value}%`;
-            break;
-          case 'equals':
-            condition = `${qi} = ?`;
-            param = value;
-            break;
-          case 'startsWith':
-            condition = `${qi} LIKE ?`;
-            param = `${value}%`;
-            break;
-          case 'endsWith':
-            condition = `${qi} LIKE ?`;
-            param = `%${value}`;
-            break;
-          case '>':
-            if (isNumeric) { condition = `${qi} > ?`; param = parseFloat(value); }
-            else { condition = `${qi} > ?`; param = value; }
-            break;
-          case '<':
-            if (isNumeric) { condition = `${qi} < ?`; param = parseFloat(value); }
-            else { condition = `${qi} < ?`; param = value; }
-            break;
-          case '>=':
-            if (isNumeric) { condition = `${qi} >= ?`; param = parseFloat(value); }
-            else { condition = `${qi} >= ?`; param = value; }
-            break;
-          case '<=':
-            if (isNumeric) { condition = `${qi} <= ?`; param = parseFloat(value); }
-            else { condition = `${qi} <= ?`; param = value; }
-            break;
-          case '=':
-            condition = `${qi} = ?`; param = isNumeric ? parseFloat(value) : value;
-            break;
-          case '!=':
-            condition = `${qi} != ?`; param = isNumeric ? parseFloat(value) : value;
-            break;
-          default:
-            condition = `${qi} LIKE ?`; param = `%${value}%`;
-        }
-
-        filterConditions.push(condition);
-        params.push(param);
-      }
-    }
+  let projection = '*';
+  if (columns && columns.length > 0) {
+    const safe = columns.filter(c => columnNames.includes(c));
+    if (safe.length > 0) projection = safe.map(quoteIdent).join(', ');
   }
 
-  // Build global search
-  if (globalSearch) {
-    const textColumns = schema.filter(c =>
-      ['TEXT', 'VARCHAR', 'CHAR'].some(t => c.type.toUpperCase().includes(t))
-    ).map(c => c.name);
-    const searchCols = textColumns.length > 0 ? textColumns : columnNames;
-    const clauses = searchCols.map(col => `${quoteIdent(col)} LIKE ?`);
-    globalSearchParts.push(`(${clauses.join(' OR ')})`);
-    for (let i = 0; i < searchCols.length; i++) {
-      params.push(`%${globalSearch}%`);
-    }
-  }
-
-  // Combine conditions
-  const joinLogic = filterLogic === 'OR' ? ' OR ' : ' AND ';
-  const combined: string[] = [];
-  if (filterConditions.length > 0) {
-    combined.push(`(${filterConditions.join(joinLogic)})`);
-  }
-  if (globalSearchParts.length > 0) {
-    combined.push(...globalSearchParts);
-  }
-  const whereClause = combined.length > 0 ? `WHERE ${combined.join(' AND ')}` : '';
+  const { whereClause, params } = buildWhere(schema, filters, globalSearch, filterLogic, columnNames);
   const orderClause = sortBy ? `ORDER BY ${quoteIdent(sortBy)} ${sortDirection === 'desc' ? 'DESC' : 'ASC'}` : '';
-  const offset = (page - 1) * pageSize;
+
+  const useLimitOverride = typeof limit === 'number' && limit > 0;
+  const effectiveLimit = useLimitOverride ? Math.min(limit!, 100000) : pageSize;
+  const effectiveOffset = useLimitOverride ? 0 : (page - 1) * pageSize;
 
   const qi = quoteIdent(tableName);
 
   if (config.type === 'mysql') {
     const pool = getMySqlPool();
     const countQuery = `SELECT COUNT(*) as count FROM ${qi} ${whereClause}`;
-    const dataQuery = `SELECT * FROM ${qi} ${whereClause} ${orderClause} LIMIT ? OFFSET ?`;
+    const dataQuery = `SELECT ${projection} FROM ${qi} ${whereClause} ${orderClause} LIMIT ? OFFSET ?`;
 
     const [countRows] = await pool.query<MysqlCountRow[]>(countQuery, params);
     const totalCount = countRows[0].count;
 
-    const dataParams: (string | number)[] = [...params, pageSize, offset];
+    const dataParams: (string | number | null)[] = [...params, effectiveLimit, effectiveOffset];
     const [rows] = await pool.query<MysqlDataRow[]>(dataQuery, dataParams);
 
     return {
@@ -308,16 +431,15 @@ export async function getTableData({
     };
   }
 
-  // SQLite
   const database = getSqliteDb();
-  const dataQuery = `SELECT * FROM ${qi} ${whereClause} ${orderClause} LIMIT ? OFFSET ?`;
+  const dataQuery = `SELECT ${projection} FROM ${qi} ${whereClause} ${orderClause} LIMIT ? OFFSET ?`;
   const countQuery = `SELECT COUNT(*) as count FROM ${qi} ${whereClause}`;
 
   const countStmt = database.prepare(countQuery);
   const dataStmt = database.prepare(dataQuery);
 
   const totalCount = (countStmt.get(...params) as { count: number }).count;
-  const rows = dataStmt.all(...params, pageSize, offset);
+  const rows = dataStmt.all(...params, effectiveLimit, effectiveOffset);
 
   return {
     rows,
