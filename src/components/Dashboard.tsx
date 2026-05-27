@@ -37,9 +37,13 @@ function formatCount(n: number): string {
 export default function Dashboard({ initialTables }: DashboardProps) {
   const [activeTable, setActiveTable] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
-  const [dark, setDark] = useState(() =>
-    typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
-  );
+  const [dark, setDark] = useState(false);
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+    setDark(document.documentElement.classList.contains('dark'));
+  }, []);
   const [tables, setTables] = useState<TableInfo[]>(
     initialTables.map(name => ({ name, rowCount: 0 }))
   );
@@ -309,9 +313,9 @@ export default function Dashboard({ initialTables }: DashboardProps) {
           <button
             onClick={toggleTheme}
             className="p-1.5 rounded-md text-slate-500 dark:text-gray-400 hover:bg-slate-100 dark:hover:bg-gray-700 transition-colors"
-            title={dark ? 'Switch to light mode' : 'Switch to dark mode'}
+            title={mounted ? (dark ? 'Switch to light mode' : 'Switch to dark mode') : 'Toggle theme'}
           >
-            {dark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            {mounted ? (dark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />) : <div className="w-4 h-4" />}
           </button>
         </div>
       </header>
